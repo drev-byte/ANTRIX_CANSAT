@@ -1,0 +1,589 @@
+// Teensy 4.1 + GY-91 (MPU6500 + BMP280)
+// + DS3231 + INA219 + 7Semi L89HA GNSS
+// + SimonK 30A ESC + BLDC reaction wheel
+
+#include <Wire.h>
+#include <Servo.h>
+#include <Adafruit_BMP280.h>
+#include <RTClib.h>
+#include <Adafruit_INA219.h>
+#include <TinyGPSPlus.h>
+#include <math.h>
+
+// ---------------- PIN / SENSOR CONFIGURATION ----------------
+#define MPU_ADDR   0x69
+#define ESC_PIN    3
+
+#define GNSS_SERIAL Serial1  // RX1 pin 0, TX1 pin 1
+
+#define AXIS_ROLL  0
+#define AXIS_PITCH 1
+#define AXIS_YAW   2
+#define CONTROL_AXIS AXIS_ROLL
+
+#define MOUNT_FLAT 0
+#define MOUNT_Y_UP 1
+#define MOUNT_X_UP 2
+#define MOUNT MOUNT_Y_UP
+
+const float SEA_LEVEL_HPA = 1013.25;
+const float ACC_SCALE = 16384.0;
+const float GYRO_SCALE = 131.0;
+const float ALPHA = 0.98;
+const float RATE_LPF = 0.3;
+
+const int ESC_MIN_US = 1000;
+const int ESC_MAX_US = 2000;
+const int SPIN_MIN_US = 1150;
+const int BASE_US = 1350;
+const int LIMIT_HI_US = 1650;
+const int LIMIT_LO_US = 1200;
+
+const float SLEW_US_PER_S = 800.0;
+const unsigned long ARM_MS = 3000;
+const unsigned long SPINUP_MS = 2000;
+
+float Kp = 4.0;
+float Kd = 1.2;
+float dirSign = 1.0;
+const float DEADBAND_DEG = 0.5;
+
+// ---------------- OBJECTS ----------------
+Servo esc;
+Adafruit_BMP280 bmp(&Wire);
+RTC_DS3231 rtc;
+Adafruit_INA219 ina219(0x40);
+TinyGPSPlus gps;
+
+// ---------------- STATES ----------------
+enum State { IDLE, ARMING, SPINUP, CONTROL };
+State state = IDLE;
+
+unsigned long stateStart = 0;
+unsigned long lastMicros = 0;
+unsigned long lastPrintMs = 0;
+unsigned long lastSlowMs = 0;
+
+float gyroBias[3] = {0, 0, 0};
+float roll = 0, pitch = 0, yawRate = 0;
+float rollRate = 0, pitchRate = 0;
+float rateFiltered = 0, angleUsed = 0;
+float cmdUs = ESC_MIN_US;
+float targetUs = ESC_MIN_US;
+
+float temperature = NAN;
+float pressure = NAN;
+float altitude = NAN;
+
+bool bmpOK = false;
+bool rtcOK = false;
+bool inaOK = false;
+
+// ---------------- MPU6500 ----------------
+void writeReg(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+bool readRaw(float a[3], float g[3]) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(MPU_ADDR, 14) != 14) return false;
+
+  int16_t v[7];
+
+  for (int i = 0; i < 7; i++) {
+    v[i] = (int16_t)((Wire.read() << 8) | Wire.read());
+  }
+
+  a[0] = v[0] / ACC_SCALE;
+  a[1] = v[1] / ACC_SCALE;
+  a[2] = v[2] / ACC_SCALE;
+
+  g[0] = v[4] / GYRO_SCALE;
+  g[1] = v[5] / GYRO_SCALE;
+  g[2] = v[6] / GYRO_SCALE;
+
+  return true;
+}
+
+void remap(const float in[3], float out[3]) {
+#if MOUNT == MOUNT_FLAT
+  out[0] = in[0];
+  out[1] = in[1];
+  out[2] = in[2];
+#elif MOUNT == MOUNT_Y_UP
+  out[0] = in[0];
+  out[1] = -in[2];
+  out[2] = in[1];
+#elif MOUNT == MOUNT_X_UP
+  out[0] = in[1];
+  out[1] = in[2];
+  out[2] = in[0];
+#endif
+}
+
+// ---------------- GNSS BAUD DETECTION ----------------
+bool detectGnssBaud() {
+  const unsigned long bauds[] = {115200, 9600, 38400};
+
+  for (unsigned long b : bauds) {
+    GNSS_SERIAL.begin(b);
+
+    unsigned long start = millis();
+    int dollars = 0;
+
+    while (millis() - start < 1500) {
+      while (GNSS_SERIAL.available()) {
+        if (GNSS_SERIAL.read() == '$') {
+          dollars++;
+        }
+      }
+
+      if (dollars >= 3) {
+        Serial.print("GNSS UART detected at ");
+        Serial.print(b);
+        Serial.println(" baud");
+
+        return true;
+      }
+    }
+
+    GNSS_SERIAL.end();
+  }
+
+  return false;
+}
+
+// ---------------- ESC CONTROL ----------------
+void killMotor() {
+  state = IDLE;
+  targetUs = ESC_MIN_US;
+  cmdUs = ESC_MIN_US;
+  esc.writeMicroseconds(ESC_MIN_US);
+}
+
+void startSequence() {
+  if (state != IDLE) return;
+
+  state = ARMING;
+  stateStart = millis();
+  cmdUs = ESC_MIN_US;
+  targetUs = ESC_MIN_US;
+
+  esc.writeMicroseconds(ESC_MIN_US);
+  Serial.println("ARMING: keep clear of the motor");
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+  while (!Serial && millis() < 3000);
+
+  // ESC starts at minimum throttle
+  esc.attach(ESC_PIN, ESC_MIN_US, ESC_MAX_US);
+  esc.writeMicroseconds(ESC_MIN_US);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  // MPU6500
+  writeReg(0x6B, 0x00);
+  delay(100);
+  writeReg(0x1A, 0x03);
+  writeReg(0x1B, 0x00);
+  writeReg(0x1C, 0x00);
+  writeReg(0x1D, 0x03);
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x75);
+  Wire.endTransmission(false);
+
+  if (Wire.requestFrom(MPU_ADDR, 1) != 1) {
+    Serial.println("MPU not responding");
+    while (true) {}
+  }
+
+  uint8_t who = Wire.read();
+
+  if (who != 0x70 && who != 0x71 && who != 0x73) {
+    Serial.print("Invalid MPU WHO_AM_I: 0x");
+    Serial.println(who, HEX);
+    while (true) {}
+  }
+
+  Serial.println("MPU6500 OK");
+
+  // BMP280
+  bmpOK = bmp.begin(0x77);
+
+  if (bmpOK) {
+    bmp.setSampling(
+      Adafruit_BMP280::MODE_NORMAL,
+      Adafruit_BMP280::SAMPLING_X2,
+      Adafruit_BMP280::SAMPLING_X16,
+      Adafruit_BMP280::FILTER_X16,
+      Adafruit_BMP280::STANDBY_MS_63
+    );
+    Serial.println("BMP280 OK");
+  } else {
+    Serial.println("WARNING: BMP280 not detected");
+  }
+
+  // DS3231
+  rtcOK = rtc.begin();
+
+  if (rtcOK) {
+    if (rtc.lostPower()) {
+      Serial.println("RTC lost power; setting compile time");
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    Serial.println("DS3231 OK");
+  } else {
+    Serial.println("WARNING: DS3231 not detected");
+  }
+
+  // INA219
+  inaOK = ina219.begin();
+
+  if (inaOK) {
+    ina219.setCalibration_32V_2A();
+    Serial.println("INA219 OK");
+  } else {
+    Serial.println("WARNING: INA219 not detected");
+  }
+
+  // GNSS
+  if (!detectGnssBaud()) {
+    Serial.println("GNSS UART not detected at tested baud rates");
+    Serial.println("Check wiring and module baud configuration");
+    GNSS_SERIAL.begin(115200);
+  }
+
+  // Gyroscope calibration
+  Serial.println("Keep board still: calibrating gyro");
+
+  const int N = 500;
+  int validSamples = 0;
+
+  for (int i = 0; i < N; i++) {
+    float a[3], g[3], gv[3];
+
+    if (readRaw(a, g)) {
+      remap(g, gv);
+
+      for (int k = 0; k < 3; k++) {
+        gyroBias[k] += gv[k];
+      }
+
+      validSamples++;
+    }
+
+    delay(3);
+  }
+
+  if (validSamples == 0) {
+    Serial.println("IMU calibration failed");
+    while (true) {}
+  }
+
+  for (int k = 0; k < 3; k++) {
+    gyroBias[k] /= validSamples;
+  }
+
+  float a[3], g[3], av[3];
+
+  if (!readRaw(a, g)) {
+    Serial.println("Initial IMU read failed");
+    while (true) {}
+  }
+
+  remap(a, av);
+
+  roll = atan2(av[1], av[2]) * 180.0 / PI;
+  pitch = atan2(-av[0],
+                sqrt(av[1] * av[1] + av[2] * av[2]))
+          * 180.0 / PI;
+
+  lastMicros = micros();
+
+  Serial.println("Setup complete");
+  Serial.println("Commands: g=start, k=kill, p/P=Kp, d/D=Kd, s=reverse sign");
+  Serial.println("Motor remains OFF until command 'g'");
+}
+
+// ---------------- SERIAL COMMANDS ----------------
+void handleSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    switch (c) {
+      case 'g':
+        startSequence();
+        break;
+
+      case 'k':
+        killMotor();
+        Serial.println("MOTOR KILLED");
+        break;
+
+      case 'p':
+        Kp = fmaxf(0.0f, Kp - 0.5f);
+        break;
+
+      case 'P':
+        Kp += 0.5f;
+        break;
+
+      case 'd':
+        Kd = fmaxf(0.0f, Kd - 0.2f);
+        break;
+
+      case 'D':
+        Kd += 0.2f;
+        break;
+
+      case 's':
+        dirSign = -dirSign;
+        Serial.print("Control sign: ");
+        Serial.println(dirSign);
+        break;
+    }
+  }
+}
+
+// ---------------- MAIN LOOP ----------------
+void loop() {
+  handleSerial();
+
+  // Parse GPS continuously, without waiting for a fix
+  while (GNSS_SERIAL.available()) {
+    gps.encode(GNSS_SERIAL.read());
+  }
+
+  // IMU update
+  float a[3], g[3], av[3], gv[3];
+
+  if (!readRaw(a, g)) {
+    killMotor();
+    Serial.println("IMU read error - motor stopped");
+    delay(10);
+    return;
+  }
+
+  remap(a, av);
+  remap(g, gv);
+
+  for (int k = 0; k < 3; k++) {
+    gv[k] -= gyroBias[k];
+  }
+
+  unsigned long now = micros();
+  float dt = (now - lastMicros) / 1000000.0f;
+  lastMicros = now;
+
+  // Avoid invalid integration steps
+  if (dt <= 0 || dt > 0.1f) {
+    dt = 0.002f;
+  }
+
+  float accRoll = atan2(av[1], av[2]) * 180.0 / PI;
+  float accPitch = atan2(-av[0],
+                         sqrt(av[1] * av[1] + av[2] * av[2]))
+                   * 180.0 / PI;
+
+  roll = ALPHA * (roll + gv[0] * dt)
+       + (1.0 - ALPHA) * accRoll;
+
+  pitch = ALPHA * (pitch + gv[1] * dt)
+        + (1.0 - ALPHA) * accPitch;
+
+  rollRate = gv[0];
+  pitchRate = gv[1];
+  yawRate = gv[2];
+
+  float rate;
+
+  switch (CONTROL_AXIS) {
+    case AXIS_ROLL:
+      angleUsed = roll;
+      rate = rollRate;
+      break;
+
+    case AXIS_PITCH:
+      angleUsed = pitch;
+      rate = pitchRate;
+      break;
+
+    default:
+      angleUsed = 0;
+      rate = yawRate;
+      break;
+  }
+
+  rateFiltered += RATE_LPF * (rate - rateFiltered);
+
+  // BMP280: update every 100 ms
+  unsigned long ms = millis();
+
+  if (bmpOK && ms - lastSlowMs >= 100) {
+    lastSlowMs = ms;
+
+    temperature = bmp.readTemperature();
+    pressure = bmp.readPressure() / 100.0f;
+    altitude = bmp.readAltitude(SEA_LEVEL_HPA);
+  }
+
+  // Reaction-wheel state machine
+  switch (state) {
+    case IDLE:
+      targetUs = ESC_MIN_US;
+      break;
+
+    case ARMING:
+      targetUs = ESC_MIN_US;
+
+      if (ms - stateStart >= ARM_MS) {
+        state = SPINUP;
+        stateStart = ms;
+        Serial.println("Spinning up reaction wheel");
+      }
+      break;
+
+    case SPINUP: {
+      float f = constrain(
+        (ms - stateStart) / (float)SPINUP_MS,
+        0.0f, 1.0f
+      );
+
+      targetUs = SPIN_MIN_US + f * (BASE_US - SPIN_MIN_US);
+
+      if (f >= 1.0f) {
+        state = CONTROL;
+        Serial.println("Control ACTIVE");
+      }
+      break;
+    }
+
+    case CONTROL: {
+      float err = angleUsed;
+
+      if (fabsf(err) < DEADBAND_DEG &&
+          CONTROL_AXIS != AXIS_YAW) {
+        err = 0;
+      }
+
+      float out = dirSign *
+                  (Kp * err + Kd * rateFiltered);
+
+      targetUs = constrain(
+        BASE_US + out,
+        (float)LIMIT_LO_US,
+        (float)LIMIT_HI_US
+      );
+      break;
+    }
+  }
+
+  // Slew-limited ESC output
+  float maxStep = SLEW_US_PER_S * dt;
+
+  if (state == IDLE) {
+    cmdUs = ESC_MIN_US;
+  } else {
+    float diff = targetUs - cmdUs;
+    cmdUs += constrain(diff, -maxStep, maxStep);
+  }
+
+  esc.writeMicroseconds((int)cmdUs);
+
+  // Telemetry every 500 ms
+  if (ms - lastPrintMs >= 500) {
+    lastPrintMs = ms;
+
+    Serial.println("------------------------------");
+
+    // RTC
+    if (rtcOK) {
+      DateTime t = rtc.now();
+
+      Serial.printf(
+        "RTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+        t.year(), t.month(), t.day(),
+        t.hour(), t.minute(), t.second()
+      );
+    } else {
+      Serial.println("RTC: unavailable");
+    }
+
+    // IMU + ESC
+    Serial.printf(
+      "IMU: Roll %.1f Pitch %.1f YawRate %.1f\n",
+      roll, pitch, yawRate
+    );
+
+    Serial.printf(
+      "Wheel: State %d Angle %.1f Rate %.1f ESC %d us Kp %.1f Kd %.1f\n",
+      (int)state, angleUsed, rateFiltered,
+      (int)cmdUs, Kp, Kd
+    );
+
+    // BMP280
+    if (bmpOK) {
+      Serial.printf(
+        "Baro: T %.1f C P %.1f hPa Alt %.1f m\n",
+        temperature, pressure, altitude
+      );
+    } else {
+      Serial.println("Baro: unavailable");
+    }
+
+    // INA219
+    if (inaOK) {
+      float busV = ina219.getBusVoltage_V();
+      float shuntV = ina219.getShuntVoltage_mV();
+      float curr = ina219.getCurrent_mA();
+      float power = ina219.getPower_mW();
+
+      Serial.printf(
+        "Power: Bus %.2f V Load %.2f V I %.1f mA P %.1f mW\n",
+        busV, busV + shuntV / 1000.0f, curr, power
+      );
+    } else {
+      Serial.println("Power: unavailable");
+    }
+
+    // GNSS
+    if (gps.location.isValid()) {
+      Serial.printf(
+        "GNSS: Lat %.6f Lon %.6f Alt %.1f m Sats %lu HDOP %.1f Speed %.1f km/h\n",
+        gps.location.lat(),
+        gps.location.lng(),
+        gps.altitude.meters(),
+        gps.satellites.value(),
+        gps.hdop.hdop(),
+        gps.speed.kmph()
+      );
+
+      if (gps.date.isValid() && gps.time.isValid()) {
+        Serial.printf(
+          "GNSS UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
+          gps.date.year(), gps.date.month(), gps.date.day(),
+          gps.time.hour(), gps.time.minute(), gps.time.second()
+        );
+      }
+    } else {
+      Serial.printf(
+        "GNSS: No valid position yet; satellites %lu; chars %lu\n",
+        gps.satellites.value(),
+        gps.charsProcessed()
+      );
+    }
+  }
+
+  delay(2);
+}
